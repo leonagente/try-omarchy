@@ -47,7 +47,10 @@ def main() -> None:
         check=False,
     )
     if result.returncode:
-        raise SystemExit(result.stderr or result.stdout)
+        import sys as _sys
+        print(result.stderr, file=_sys.stderr)
+        print(result.stdout, file=_sys.stderr)
+        raise SystemExit("resolve-package-lock: pacman -Sp failed")
 
     resolved: dict[str, str] = {}
     for line in result.stdout.splitlines():

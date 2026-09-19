@@ -97,10 +97,38 @@ pacman -S --needed --noconfirm \
   cairo glib2 hyprgraphics hyprlang iniparser libxkbcommon pango >/dev/null
 
 for name in aquamarine hyprtoolkit; do
-  case "$name" in
-    aquamarine) expected_version=0.14.0; expected_pkgrel=2 ;;
-    hyprtoolkit) expected_version=0.5.4; expected_pkgrel=6.1 ;;
-  esac
+  expected_version=$(python3 - "$spec" "$name" <<'PY'
+import json
+import pathlib
+import sys
+
+spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
+name = sys.argv[2]
+for pin in spec.get("inputs", {}).get("abiPackagePins", []):
+    if pin.get("name") == name:
+        version, _, pkgrel = pin["version"].rpartition("-")
+        print(version)
+        break
+else:
+    raise SystemExit(f"abiPackagePins is missing the reviewed pin: {name}")
+PY
+) || fail "could not read the pinned ABI version for $name"
+  expected_pkgrel=$(python3 - "$spec" "$name" <<'PY'
+import json
+import pathlib
+import sys
+
+spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
+name = sys.argv[2]
+for pin in spec.get("inputs", {}).get("abiPackagePins", []):
+    if pin.get("name") == name:
+        _, _, pkgrel = pin["version"].rpartition("-")
+        print(pkgrel)
+        break
+else:
+    raise SystemExit(f"abiPackagePins is missing the reviewed pin: {name}")
+PY
+) || fail "could not read the pinned ABI pkgrel for $name"
 mapfile -t metadata < <(python3 - "$spec" "$guest_dir" "$name" <<'PY'
 import json
 import pathlib
@@ -109,8 +137,18 @@ import sys
 spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
 guest = pathlib.Path(sys.argv[2]).resolve(strict=True)
 pins = spec.get("inputs", {}).get("abiPackagePins")
-if pins != [{"name": "aquamarine", "version": "0.14.0-2"}, {"name": "hyprtoolkit", "version": "0.5.4-6.1"}]:
+names = [pin.get("name") for pin in pins] if isinstance(pins, list) else []
+if names != ["aquamarine", "hyprtoolkit"]:
     raise SystemExit("abiPackagePins must contain the reviewed compatible pair")
+for pin in pins:
+    if set(pin) != {"name", "version"} or not isinstance(pin.get("version"), str):
+        raise SystemExit("abiPackagePins entries must carry a reviewed name/version pair")
+    version, _, pkgrel = pin["version"].rpartition("-")
+    component = spec.get("supplyChain", {}).get(pin["name"], {})
+    if not version or not pkgrel or f"{version}-{pkgrel}" != pin["version"]:
+        raise SystemExit(f"abiPackagePins version is not <version>-<pkgrel>: {pin}")
+    if component.get("version") != version or component.get("pkgrel") != pkgrel:
+        raise SystemExit(f"abiPackagePins {pin['name']} disagrees with supplyChain metadata")
 component = spec["supplyChain"][sys.argv[3]]
 required = (
     "version",
@@ -238,7 +276,7 @@ with tarfile.open(archive, "r:gz") as source:
 PY
 
 if ! id -u abi-build >/dev/null 2>&1; then
-  useradd --system --create-home --home-dir "$stage/home" --shell /usr/bin/nologin \
+  useradd --system --create-home --home-dir "$stage/home" --shell /bin/sh \
     abi-build
   added_build_user=1
 else
@@ -287,9 +325,38 @@ with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as package:
     pkginfo = info.read().decode()
     if f"pkgname = {name}\n" not in pkginfo or f"pkgver = {version}-{pkgrel}\n" not in pkginfo or "arch = aarch64\n" not in pkginfo:
         raise SystemExit("ABI package identity mismatch")
-    abi = "provides = libaquamarine.so=13-64" if name == "aquamarine" else "depend = libaquamarine.so=13-64"
-    if abi not in pkginfo:
-        raise SystemExit("ABI package does not provide or depend on libaquamarine.so=13")
+    def pkginfo_values(key):
+        values = []
+        for line in pkginfo.splitlines():
+            key_text, separator, value = line.partition(" = ")
+            if separator and key_text == key:
+                values.append(value)
+        return values
+
+    def abi_version(value):
+        # pacman writes soname provides/depends as "libaquamarine.so=14-64"
+        # (version-arch). Return the numeric ABI ("14") or None.
+        so, separator, suffix = value.partition("libaquamarine.so=")
+        if not separator:
+            return None
+        number, _, _arch = suffix.partition("-")
+        return number or None
+
+    REVIEWED_AQUAMARINE_ABI = "14"
+    provides = [abi for value in pkginfo_values("provides") if (abi := abi_version(value))]
+    depends = [abi for value in pkginfo_values("depend") if (abi := abi_version(value))]
+    if name == "aquamarine":
+        if provides != [REVIEWED_AQUAMARINE_ABI]:
+            raise SystemExit(
+                "aquamarine package ABI mismatch: provides libaquamarine.so=%s "
+                "(reviewed ABI is libaquamarine.so=%s)" % (provides or "none", REVIEWED_AQUAMARINE_ABI)
+            )
+    else:
+        if depends != [REVIEWED_AQUAMARINE_ABI]:
+            raise SystemExit(
+                "hyprtoolkit package ABI mismatch: depends libaquamarine.so=%s "
+                "(reviewed ABI is libaquamarine.so=%s)" % (depends or "none", REVIEWED_AQUAMARINE_ABI)
+            )
     member = package.extractfile(f"usr/lib/lib{name}.so.{version}")
     if member is None:
         raise SystemExit("ABI package is missing its versioned library")
